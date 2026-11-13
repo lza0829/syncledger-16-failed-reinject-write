@@ -136,7 +136,7 @@ watch(() => route.query.ticket, async (q) => {
     <h1>差异处置</h1>
     <p class="muted">
       处置单状态机：待认领 → 处理中 → 待复核 → 已关闭；复核驳回回处理中。非法跳转服务端拒绝，
-      回灌失败留在处理中并留痕，复核以侧上实际值与回灌记录逐条比对。
+      回灌失败留在处理中并留痕（不写侧快照），需先有成功回灌才能提交复核；复核只认最近一次成功回灌与侧上实际值。
     </p>
     <p v-if="err" class="tag danger">{{ err }}</p>
 
@@ -231,16 +231,18 @@ watch(() => route.query.ticket, async (q) => {
             <button :disabled="busy" @click="doReinject">执行回灌</button>
           </div>
           <p class="muted" style="font-size:0.8rem;margin:0.2rem 0">
-            回灌把约定字段写入指定侧快照并记录旧值/新值；勾选故障注入可验证失败留痕与状态约束。
+            回灌把约定字段写入指定侧快照并记录旧值/新值；勾选故障注入只留失败台账、不写侧快照，
+            失败记录不能作为提交复核的依据。
           </p>
           <button class="ghost" :disabled="busy" @click="doSubmit">提交复核</button>
         </template>
 
         <!-- 待复核 -->
         <template v-if="detail.status === 'pending_review'">
-          <h4 style="margin-bottom:0.3rem">复核（对照侧实际值与回灌记录）</h4>
+          <h4 style="margin-bottom:0.3rem">复核（对照侧实际值与最近成功回灌）</h4>
           <p class="muted" style="font-size:0.82rem">
-            服务端重新读取侧快照逐条比对；侧值与回灌记录不符时，通过会被拒绝。
+            服务端重新读取侧快照，与每个字段最近一次成功回灌逐条比对；失败记录不参与比对，
+            侧值不符时通过会被拒绝。
           </p>
           <label>驳回原因（驳回时必填）<textarea v-model="rejectReason"></textarea></label>
           <div class="form-row">
@@ -266,7 +268,7 @@ watch(() => route.query.ticket, async (q) => {
         </table>
 
         <!-- 回灌台账 -->
-        <h4>回灌记录（旧值 → 新值）</h4>
+        <h4>回灌记录（旧值 → 新值；失败记录仅留痕，不写入侧快照）</h4>
         <table>
           <thead><tr><th>ID</th><th>侧</th><th>结果</th><th>旧值</th><th>新值</th><th>失败原因</th><th>时间</th></tr></thead>
           <tbody>

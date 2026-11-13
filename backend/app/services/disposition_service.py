@@ -9,10 +9,13 @@ Implements the full loop:
 Hard rules enforced here, never trusted to the UI:
   * illegal status jumps are rejected;
   * reinject is only possible on a claimed (in_progress) ticket;
-  * a failed reinject is recorded with old/new values and leaves the ticket
-    actionable — it can never enter pending_review;
-  * review re-reads the side snapshot and compares it to every successful
-    reinject record, so a ticket cannot close unless the side really changed;
+  * a failed reinject writes NOTHING to the side snapshot; it is recorded in
+    the ledger with old/new values and leaves the ticket actionable — it can
+    never enter pending_review;
+  * submit-review requires at least one SUCCESSFUL reinject;
+  * review re-reads the side snapshot and compares it to the latest successful
+    reinject record per field (failed records are audit-only), so a ticket
+    cannot close unless the side really changed;
   * close is only reachable via review approval.
 """
 
@@ -282,20 +285,9 @@ def reinject_disposition(
         old_values = {f: current_row.get(f) for f in fields}
         now = _now()
 
-        merged_row = dict(current_row)
-        merged_row.update(fields)
-        for k, v in target_key.items():
-            merged_row.setdefault(k, v)
-
-        snap_repo.upsert_snapshot_row(
-            conn,
-            pair_id=pair["id"],
-            side=side,
-            align_key=target_key,
-            row=merged_row,
-            updated_at=now,
-        )
-
+        # A failed attempt must never touch the side snapshot: the opposite
+        # side would otherwise read it as a real correction on the next
+        # reconcile. Record the attempt and leave the ticket actionable.
         if simulate_failure:
             reason = "模拟侧写入失败：侧夹具/侧快照拒绝本次写入（故障注入）"
             _record_reinject_failure(
@@ -313,6 +305,20 @@ def reinject_disposition(
             failed["write_failed"] = True
             failed["fail_reason"] = reason
             return failed
+
+        merged_row = dict(current_row)
+        merged_row.update(fields)
+        for k, v in target_key.items():
+            merged_row.setdefault(k, v)
+
+        snap_repo.upsert_snapshot_row(
+            conn,
+            pair_id=pair["id"],
+            side=side,
+            align_key=target_key,
+            row=merged_row,
+            updated_at=now,
+        )
 
         ticket_repo.insert_reinject_record(
             conn,
@@ -360,8 +366,10 @@ def submit_for_review(ticket_id: int) -> dict[str, Any]:
                 f"当前状态 {STATUS_LABELS[ticket['status']]} 不可提交复核"
             )
         records = ticket_repo.list_reinject_records(conn, ticket_id=ticket_id)
-        if not records:
-            raise DispositionError("尚无回灌记录，不得提交复核（禁止只改单据状态）")
+        if not any(r["result"] == "success" for r in records):
+            raise DispositionError(
+                "尚无成功的回灌记录，不得提交复核（失败记录不能作为复核依据）"
+            )
         target = next_status(Action.SUBMIT_REVIEW.value, ticket["status"])
         now = _now()
         ticket_repo.update_status(conn, ticket_id=ticket_id, status=target, updated_at=now)
@@ -417,8 +425,11 @@ def review_disposition(ticket_id: int, *, approved: bool, reason: str | None = N
             return get_disposition(ticket_id)
 
         # Approval gate: re-read the actual side values and compare against
-        # every successful reinject record. Mismatch means the side was never
-        # really corrected (or drifted) — approval is refused.
+        # the latest successful reinject per field. A failed attempt is not
+        # evidence — with no successful record there is nothing to approve.
+        records = ticket_repo.list_reinject_records(conn, ticket_id=ticket_id)
+        if not any(r["result"] == "success" for r in records):
+            raise DispositionError("没有成功的回灌记录，不得复核通过")
         checks = _check_side_values(conn, ticket)
         mismatches = [c for c in checks if not c["matches"]]
         if mismatches:
@@ -458,6 +469,10 @@ def _check_side_values(conn, ticket: dict[str, Any]) -> list[dict[str, Any]]:
     records = ticket_repo.list_reinject_records(conn, ticket_id=ticket["id"])
     latest: dict[tuple, dict[str, Any]] = {}
     for rec in records:
+        # Failed attempts never wrote the side; they are audit-only and must
+        # not become the expected value at review.
+        if rec["result"] != "success":
+            continue
         for field, expected in rec["new_values"].items():
             latest[(rec["side"], json.dumps(rec["target_key"], sort_keys=True), field)] = {
                 "reinject_id": rec["id"],
@@ -499,6 +514,53 @@ def _check_side_values(conn, ticket: dict[str, Any]) -> list[dict[str, Any]]:
     return checks
 
 
+def _failed_snapshot_pollution(conn, ticket: dict[str, Any]) -> list[dict[str, Any]]:
+    """Detect side values that a FAILED reinject must never have written.
+
+    A failed attempt is not a write. If the side snapshot holds, for a field,
+    exactly the value from a failure and that field was not later successfully
+    corrected, the failure polluted the side — the next reconcile would then
+    treat the failed attempt as a real correction.
+    """
+    records = ticket_repo.list_reinject_records(conn, ticket_id=ticket["id"])
+    latest_success: dict[tuple, dict[str, Any]] = {}
+    for rec in records:
+        if rec["result"] != "success":
+            continue
+        for field, value in rec["new_values"].items():
+            latest_success[(rec["side"], json.dumps(rec["target_key"], sort_keys=True), field)] = value
+
+    problems: list[dict[str, Any]] = []
+    for rec in records:
+        if rec["result"] == "success":
+            continue
+        snap = snap_repo.get_snapshot_row(
+            conn, pair_id=ticket["pair_id"], side=rec["side"], align_key=rec["target_key"]
+        )
+        if snap is None:
+            continue
+        for field, value in rec["new_values"].items():
+            key = (rec["side"], json.dumps(rec["target_key"], sort_keys=True), field)
+            # A later successful write legitimately owns the value it wrote.
+            if latest_success.get(key) == value:
+                continue
+            # If new == old the value is unchanged either way, so it cannot
+            # prove that the failed write landed.
+            if value == rec["old_values"].get(field):
+                continue
+            if snap["row"].get(field) == value:
+                problems.append(
+                    {
+                        "ticket_id": ticket["id"],
+                        "reinject_id": rec["id"],
+                        "side": rec["side"],
+                        "field": field,
+                        "value": value,
+                    }
+                )
+    return problems
+
+
 def list_side_snapshots() -> list[dict[str, Any]]:
     conn = connect()
     try:
@@ -536,16 +598,19 @@ def cross_evidence() -> dict[str, Any]:
 
         checks: list[dict[str, Any]] = []
 
-        # 1. Every closed ticket's side values really match its reinject ledger.
+        # 1. Every closed ticket's side values really match the LATEST successful
+        # reinject per field; a failed record is never evidence of a fix.
         for t in tickets:
             if t["status"] != DispositionStatus.CLOSED.value:
                 continue
+            records = ticket_repo.list_reinject_records(conn, ticket_id=t["id"])
+            succeeded = any(r["result"] == "success" for r in records)
             bad = [c for c in _check_side_values(conn, t) if not c["matches"]]
             checks.append(
                 {
-                    "name": f"处置单 #{t['id']} 侧值与回灌记录一致",
-                    "pass": not bad,
-                    "detail": bad or "全部字段一致",
+                    "name": f"处置单 #{t['id']} 侧值与最近成功回灌一致",
+                    "pass": succeeded and not bad,
+                    "detail": bad or ("全部字段一致" if succeeded else "无成功回灌记录"),
                 }
             )
 
@@ -584,7 +649,20 @@ def cross_evidence() -> dict[str, Any]:
             }
         )
 
-        # 4. Status-count sum equals ticket total.
+        # 4. A failed attempt must leave no trace in the side snapshot: the
+        # side row must never carry a value that only a failed record wrote.
+        polluted: list[dict[str, Any]] = []
+        for t in tickets:
+            polluted.extend(_failed_snapshot_pollution(conn, t))
+        checks.append(
+            {
+                "name": "失败回灌未写入侧快照",
+                "pass": not polluted,
+                "detail": polluted or "侧快照无失败脏值",
+            }
+        )
+
+        # 5. Status-count sum equals ticket total.
         checks.append(
             {
                 "name": "各状态数量之和等于处置单总数",

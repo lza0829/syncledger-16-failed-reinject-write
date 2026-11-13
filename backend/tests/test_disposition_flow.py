@@ -142,8 +142,68 @@ def test_failed_reinject_keeps_ticket_actionable_and_blocks_review(client):
     assert failed_rec["fail_reason"]
     assert detail["last_fail_reason"]
 
+    # a failed write must leave the side untouched — no failed value in the
+    # snapshot that the next reconcile would overlay as a real correction
+    snapped = [
+        s for s in client.get("/api/side-snapshots").json()
+        if s["pair_id"] == 2 and s["side"] == "right"
+        and s["align_key"] == diff["align_key"]
+    ]
+    assert not snapped, "失败回灌不得写入侧快照"
+    assert detail["side_view"]["right"]["amount"] != 999
+
+    # failed records are not evidence: review cannot be submitted
     r = client.post(f"/api/dispositions/{tid}/submit-review")
-    assert r.status_code in (200, 400)
+    assert r.status_code == 400
+    assert "成功" in r.text
+    assert client.get(f"/api/dispositions/{tid}").json()["status"] == "in_progress"
+
+    # the next reconcile must still see the original mismatch, not the
+    # failed attempt's value
+    batch = _run_pair(client, 2)
+    assert batch["field_mismatch"] >= 1
+
+    # a real successful write then lets the normal chain proceed
+    ok = client.post(
+        f"/api/dispositions/{tid}/reinject",
+        json={"side": "right", "fields": {"amount": diff["left"]["amount"]}},
+    )
+    assert ok.status_code == 200
+    assert client.post(f"/api/dispositions/{tid}/submit-review").status_code == 200
+    r = client.post(f"/api/dispositions/{tid}/review", json={"approved": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "closed"
+
+
+def test_failed_reinject_after_success_does_not_count_for_review(client):
+    _run_pair(client, 1)
+    free = _first_field_mismatch(client, 1)
+    tid = client.post("/api/dispositions", json={"diff_id": free["id"]}).json()["id"]
+    client.post(f"/api/dispositions/{tid}/claim", json={"assignee": "holly"})
+
+    ok = client.post(
+        f"/api/dispositions/{tid}/reinject",
+        json={"side": "right", "fields": {"qty": free["left"]["qty"]}},
+    )
+    assert ok.status_code == 200
+    # a later FAILED attempt must neither pollute the side nor become the
+    # expected value at review
+    bad = client.post(
+        f"/api/dispositions/{tid}/reinject",
+        json={"side": "right", "fields": {"qty": 555}, "simulate_failure": True},
+    )
+    assert bad.status_code == 422
+    # a failed attempt also must not erase the prior success's evidence
+    assert client.post(f"/api/dispositions/{tid}/submit-review").status_code == 200
+    r = client.post(f"/api/dispositions/{tid}/review", json={"approved": True})
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "closed"
+
+    snapped = next(
+        s for s in client.get("/api/side-snapshots").json()
+        if s["pair_id"] == 1 and s["side"] == "right" and s["align_key"] == free["align_key"]
+    )
+    assert snapped["row"]["qty"] == free["left"]["qty"]
 
 
 def test_review_rejection_returns_to_in_progress_with_reason(client):
@@ -313,3 +373,42 @@ def test_cross_evidence_mutually_consistent(client):
 
     dash = client.get("/api/dashboard").json()
     assert dash["open_dispositions"] + dash["closed_dispositions"] == ev["disposed_total"]
+
+
+def test_evidence_flags_side_snapshot_polluted_by_failed_attempt(client):
+    """Legacy/accidental dirty side data from a failure must fail the 互证."""
+    _run_pair(client, 1)
+    free = _first_field_mismatch(client, 1)
+    tid = client.post("/api/dispositions", json={"diff_id": free["id"]}).json()["id"]
+    client.post(f"/api/dispositions/{tid}/claim", json={"assignee": "ivy"})
+    failed = client.post(
+        f"/api/dispositions/{tid}/reinject",
+        json={"side": "right", "fields": {"qty": 31337}, "simulate_failure": True},
+    )
+    assert failed.status_code == 422
+    assert not [
+        s for s in client.get("/api/side-snapshots").json()
+        if s["pair_id"] == 1 and s["side"] == "right" and s["align_key"] == free["align_key"]
+    ]
+
+    # simulate a pre-existing polluted snapshot (e.g. written by the old bug)
+    from app.db import connect
+    from app.repositories import side_snapshots as snap_repo
+
+    conn = connect()
+    snap_repo.upsert_snapshot_row(
+        conn,
+        pair_id=1,
+        side="right",
+        align_key=free["align_key"],
+        row={**free["right"], "qty": 31337},
+        updated_at="2026-11-13T00:00:00Z",
+    )
+    conn.commit()
+    conn.close()
+
+    ev = client.get("/api/dispositions/evidence").json()
+    fail_check = next(c for c in ev["checks"] if c["name"] == "失败回灌未写入侧快照")
+    assert fail_check["pass"] is False
+    assert any(p["ticket_id"] == tid for p in fail_check["detail"])
+    assert ev["all_pass"] is False
